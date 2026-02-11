@@ -9,6 +9,11 @@ from telegram import Update
 # Added CommandHandler
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 import nest_asyncio
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import io
+from collections import defaultdict
 
 load_dotenv()
 nest_asyncio.apply() 
@@ -68,6 +73,35 @@ def delete_last_transaction():
         print(f"Delete Error: {e}")
         return False
 
+
+def get_monthly_summary():
+    data=get_sheet_data()
+    if not data:
+        return 0.0, {}
+    
+    current_month=datetime.now().strftime("%m-%Y")
+
+    total_month=0.0
+    category_totals=defaultdict(float)
+
+    for row in data[1:]:
+        try:
+            date_cell=row[0]
+
+            if current_month in date_cell:
+                amount_str=row[3].replace(",",".")
+                amount=float(amount_str)
+                category=row[1].strip() # remove extra spaces
+
+                total_month+=amount
+                category_totals[category]+=amount
+        except Exception as e:
+            continue
+
+
+    
+    return total_month, category_totals
+
 # --- CORE LOGIC ---
 
 def analyze_expenses(user_text):
@@ -108,6 +142,7 @@ def save_on_sheet(data_json):
     except Exception as e:
         print(f"Sheet Error: {e}")
         return False
+    
 
 # --- TELEGRAM HANDLERS ---
 
@@ -140,8 +175,56 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Handler for /report
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tot = calculate_total()
-    await update.message.reply_text(f"💰 Total Expenses: {tot:.2f}")
+    total,cat_dict=get_monthly_summary()
+
+    if total==0:
+        await update.message.reply_text("No expense found this month")
+        return
+    month_name=datetime.now().strftime("%B %Y")
+    message=f"**{month_name} REPORT**\n\n"
+
+    sorted_cats=sorted(cat_dict.items(),key=lambda x: x[1], reverse=True)
+
+    for cat, amount in sorted_cats:
+        message+=f"{cat}: {amount:.2f}€\n"
+
+    message+=f"\n----------\n"
+    message+=f"**TOTAL: {total:.2f}€**"
+
+    await update.message.reply_text(message,parse_mode="Markdown")
+
+
+async def cmd_graph(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    summary,cat_totals=get_monthly_summary()
+
+    if summary==0:
+        await update.message.reply_text("No data found for this month")
+        return
+    
+    categories=list(cat_totals.keys())
+    values=list(cat_totals.values())
+
+    plt.figure(figsize=(5,5))
+
+    #Show percentages with 1 number after .
+    plt.pie(values,labels=categories,autopct='%1.1f%%',startangle=90)
+
+    month=datetime.now().strftime("%m %Y")
+
+    plt.title(f"{month} Report")
+    
+    buf=io.BytesIO()
+
+    plt.savefig(buf,format="png")
+
+
+    buf.seek(0)
+
+    await update.message.reply_photo(photo=buf)
+    plt.close()
+    buf.close()
+
+
 
 # --- MAIN ---
 
@@ -151,6 +234,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("undo", cmd_undo))
     application.add_handler(CommandHandler("report", cmd_report))
+    application.add_handler(CommandHandler("graph",cmd_graph))
 
     handler_messages = MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message)
     application.add_handler(handler_messages)
