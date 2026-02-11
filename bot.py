@@ -15,6 +15,11 @@ import matplotlib.pyplot as plt
 import io
 from collections import defaultdict
 
+scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+client = gspread.authorize(creds)
+SHEET = client.open("ExpenseTracker").sheet1
+
 load_dotenv()
 nest_asyncio.apply() 
 
@@ -31,12 +36,8 @@ model = genai.GenerativeModel("gemini-flash-latest", generation_config={"respons
 # --- HELPER FUNCTIONS ---
 
 def get_sheet_data():
-    scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     try:
-        creds=Credentials.from_service_account_file("credentials.json",scopes=scopes)
-        client=gspread.authorize(creds)
-        sheet=client.open("ExpenseTracker").sheet1
-        data=sheet.get_all_values()
+        data=SHEET.get_all_values()
         return data
     except Exception as e:
         print(f"Error {e}")
@@ -57,15 +58,12 @@ def calculate_total():
     return total
 
 def delete_last_transaction():
-    scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+
     try:
-        creds=Credentials.from_service_account_file("credentials.json",scopes=scopes)
-        client=gspread.authorize(creds)
-        sheet=client.open("ExpenseTracker").sheet1
         data=get_sheet_data()
         n_rows=len(data)
         if n_rows>1:
-            sheet.delete_rows(n_rows)
+            SHEET.delete_rows(n_rows)
             return True
         else:
             return False
@@ -74,12 +72,12 @@ def delete_last_transaction():
         return False
 
 
-def get_monthly_summary():
+def get_monthly_summary(target_month=None):
     data=get_sheet_data()
     if not data:
         return 0.0, {}
     
-    current_month=datetime.now().strftime("%m-%Y")
+    current_month=(datetime.now().strftime("%m-%Y"),target_month)[target_month is not None]
 
     total_month=0.0
     category_totals=defaultdict(float)
@@ -104,17 +102,40 @@ def get_monthly_summary():
 
 # --- CORE LOGIC ---
 
+def normalize_date(user_text):
+    date_today = datetime.now().strftime("%d-%m-%Y")
+    
+    prompt = f"""
+    Oggi è il {date_today}.
+    Il tuo compito è convertire l'input utente in una data formato 'MM-YYYY'.
+    Input utente: "{user_text}"
+    
+    Regole:
+    1. Se l'utente dice "mese scorso" e oggi è Febbraio, restituisci Gennaio.
+    2. Restituisci SOLO un JSON valido: {{"target": "MM-YYYY"}}
+    3. Se l'input non ha senso temporale, restituisci null.
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        data = json.loads(response.text)
+        return data.get("target") # Restituisce es: "01-2025"
+    except Exception as e:
+        print(f"Date AI Error: {e}")
+        return None
+
+
 def analyze_expenses(user_text):
-    data_oggi = datetime.now().strftime("%d-%m-%Y")
+    date_today = datetime.now().strftime("%d-%m-%Y")
     prompt = f"""
     Sei un assistente contabile preciso.
-    CONTESTO TEMPORALE: Oggi è il giorno {data_oggi}.
+    CONTESTO TEMPORALE: Oggi è il giorno {date_today}.
     Analizza: "{user_text}"
     Estrai JSON:
     {{
         "oggetto": "cosa è stato acquistato",
         "importo": numero (usa il punto per i decimali, es. 12.50),
-        "categoria": "scegli una tra [Cibo, Trasporti, Casa, Svago, Investimenti]",
+        "categoria": "scegli una tra [Cibo, Trasporti, Casa, Svago, Investimenti, Salute, Shopping, Servizi, Regali, Altro]",
         "data": "data della spesa in formato DD-MM-YYYY"
     }}
     """
@@ -127,17 +148,13 @@ def analyze_expenses(user_text):
         return None # FIXED: Return None on error
 
 def save_on_sheet(data_json):
-    scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     try:
-        creds=Credentials.from_service_account_file("credentials.json",scopes=scopes)
-        client=gspread.authorize(creds)
-        sheet=client.open("ExpenseTracker").sheet1
         row=[data_json.get("data"),
             data_json.get("categoria"),
             data_json.get("oggetto"),
             data_json.get("importo")
             ]
-        sheet.append_row(row)
+        SHEET.append_row(row)
         return True
     except Exception as e:
         print(f"Sheet Error: {e}")
@@ -156,6 +173,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_message(update:Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.chat.send_action(action="typing")
+
     user_text=update.message.text
     # await update.message.reply_text("Analyzing expenses...") 
     data=analyze_expenses(user_text)
@@ -175,27 +194,56 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Handler for /report
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total,cat_dict=get_monthly_summary()
+    target_date = None
+    report_title = datetime.now().strftime("%B %Y")
+
+    if context.args:
+        raw_text = " ".join(context.args)
+        
+        target_date = normalize_date(raw_text)
+        
+        if not target_date:
+            await update.message.reply_text("🤷‍♂️ Did not understand month.")
+            return
+    
+        report_title = target_date
+
+    total,cat_dict=get_monthly_summary(target_date)
 
     if total==0:
-        await update.message.reply_text("No expense found this month")
+        await update.message.reply_text(f"📉 No expense found for: {report_title}")
         return
-    month_name=datetime.now().strftime("%B %Y")
-    message=f"**{month_name} REPORT**\n\n"
+
+    message=f"📊 **REPORT: {report_title}**\n\n"
 
     sorted_cats=sorted(cat_dict.items(),key=lambda x: x[1], reverse=True)
 
     for cat, amount in sorted_cats:
         message+=f"{cat}: {amount:.2f}€\n"
 
-    message+=f"\n----------\n"
+    message+=f"\n----------------\n"
     message+=f"**TOTAL: {total:.2f}€**"
 
     await update.message.reply_text(message,parse_mode="Markdown")
 
 
 async def cmd_graph(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    summary,cat_totals=get_monthly_summary()
+    await update.message.chat.send_action(action="upload_photo")
+
+    target_date = None
+    report_title = datetime.now().strftime("%m-%Y")
+
+    if context.args:
+        raw_text = " ".join(context.args)
+        target_date = normalize_date(raw_text)
+        
+        if not target_date:
+            await update.message.reply_text("🤷‍♂️ Non ho capito a quale mese ti riferisci per il grafico.")
+            return
+        
+        report_title = target_date
+
+    summary,cat_totals=get_monthly_summary(target_date)
 
     if summary==0:
         await update.message.reply_text("No data found for this month")
@@ -204,24 +252,24 @@ async def cmd_graph(update:Update, context:ContextTypes.DEFAULT_TYPE):
     categories=list(cat_totals.keys())
     values=list(cat_totals.values())
 
-    plt.figure(figsize=(5,5))
+    plt.figure(figsize=(6,6))
 
     #Show percentages with 1 number after .
-    plt.pie(values,labels=categories,autopct='%1.1f%%',startangle=90)
+    plt.pie(values,labels=categories,autopct='%1.1f%%',startangle=140)
 
-    month=datetime.now().strftime("%m %Y")
 
-    plt.title(f"{month} Report")
+    plt.title(f"Expense Distribution: {report_title}")
     
+    #Save on RAM
     buf=io.BytesIO()
-
     plt.savefig(buf,format="png")
-
-
     buf.seek(0)
 
     await update.message.reply_photo(photo=buf)
+
+    #Clean
     plt.close()
+    plt.clf()
     buf.close()
 
 
